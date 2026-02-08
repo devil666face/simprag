@@ -12,10 +12,10 @@ from pymilvus import (
 )
 
 DOCS_DIR = "docs"
-COLLECTION = "rag_docs"
+COLLECTION = "docs"
 EMBED_MODEL_NAME = "multi-qa-MiniLM-L6-cos-v1"
-# В реальном проекте лучше сделать постоянный путь, а не mkdtemp()
-MILVUS_URI = str(Path("milvus_data") / "docling.db")
+MILVUS_URI = str(Path("data") / "docling.db")
+
 converter = DocumentConverter()
 emb_model = SentenceTransformer(EMBED_MODEL_NAME)
 emb_dim = emb_model.get_sentence_embedding_dimension()
