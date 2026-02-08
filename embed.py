@@ -1,35 +1,37 @@
-import glob
+#!.venv/bin/python3
 from pathlib import Path
+
 from docling.document_converter import DocumentConverter
-from sentence_transformers import SentenceTransformer
+from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from pymilvus import (
-    connections,
-    FieldSchema,
+    Collection,
     CollectionSchema,
     DataType,
-    Collection,
+    FieldSchema,
+    connections,
     utility,
 )
+from sentence_transformers import SentenceTransformer
 
 DOCS_DIR = "docs"
 COLLECTION = "docs"
-EMBED_MODEL_NAME = "multi-qa-MiniLM-L6-cos-v1"
+EMBED_MODEL_NAME = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
 MILVUS_URI = str(Path("data") / "docling.db")
 
 converter = DocumentConverter()
-emb_model = SentenceTransformer(EMBED_MODEL_NAME)
-emb_dim = emb_model.get_sentence_embedding_dimension()
+transformer = SentenceTransformer(EMBED_MODEL_NAME)
+dimension = transformer.get_sentence_embedding_dimension()
+tokenizer = HuggingFaceTokenizer(tokenizer=transformer.tokenizer)
+chunker = HybridChunker(tokenizer=tokenizer, merge_peers=True)
 
 
-def chunk_text(text: str, max_chars: int = 800):
-    text = text.strip()
-    for i in range(0, len(text), max_chars):
-        yield text[i : i + max_chars]
-
-
-def convert_file(path: str) -> str:
+def convert_file(path: str) -> list[str]:
+    """Convert a file with Docling and return contextualized chunks."""
     result = converter.convert(path)
-    return result.document.export_to_markdown()
+    dl_doc = result.document
+    chunk_iter = chunker.chunk(dl_doc=dl_doc)
+    return [chunker.contextualize(chunk=c) for c in chunk_iter]
 
 
 def get_or_create_collection() -> Collection:
@@ -56,12 +58,12 @@ def get_or_create_collection() -> Collection:
         FieldSchema(
             name="embedding",
             dtype=DataType.FLOAT_VECTOR,
-            dim=emb_dim,
+            dim=dimension,
         ),
     ]
     schema = CollectionSchema(fields, description="RAG documents")
-    col = Collection(name=COLLECTION, schema=schema)
-    col.create_index(
+    collection = Collection(name=COLLECTION, schema=schema)
+    collection.create_index(
         field_name="embedding",
         index_params={
             "index_type": "IVF_FLAT",
@@ -69,21 +71,24 @@ def get_or_create_collection() -> Collection:
             "params": {"nlist": 1024},
         },
     )
-    return col
+    return collection
 
 
-def ingest():
-    col = get_or_create_collection()
-    files = []
-    for ext in ("*.pdf", "*.docx", "*.txt"):
-        files.extend(glob.glob(str(Path(DOCS_DIR) / ext)))
+def main():
+    collection = get_or_create_collection()
+    # Traverse all files under DOCS_DIR; Docling will decide what it can parse.
+    files = [p for p in Path(DOCS_DIR).rglob("*") if p.is_file()]
     sources, texts, vectors = [], [], []
     for path in files:
-        full_text = convert_file(path)
-        chunks = list(chunk_text(full_text))
+        try:
+            chunks = convert_file(str(path))
+        except Exception as exc:
+            # Skip files Docling cannot handle.
+            print(f"Skipping {path}: {exc}")
+            continue
         if not chunks:
             continue
-        embs = emb_model.encode(chunks).tolist()
+        embs = transformer.encode(chunks).tolist()
         for chunk, vec in zip(chunks, embs):
             sources.append(str(path))
             texts.append(chunk)
@@ -91,10 +96,10 @@ def ingest():
     if not vectors:
         print("No data to ingest")
         return
-    col.insert([sources, texts, vectors])
-    col.flush()
+    collection.insert([sources, texts, vectors])
+    collection.flush()
     print(f"Ingested {len(vectors)} chunks into '{COLLECTION}' at {MILVUS_URI}")
 
 
 if __name__ == "__main__":
-    ingest()
+    main()
