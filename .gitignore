@@ -3,3 +3,5 @@ __pycache__
 data/docling.db
 data/.docling.db.lock
 docs
+/simprag.zip
+/data/docling.2.db
