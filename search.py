@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, cast
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import Icon, ToolAnnotations
 from pymilvus import Collection, connections
 from sentence_transformers import SentenceTransformer
 
@@ -17,6 +18,33 @@ DEFAULT_EMBED_MODEL_NAME = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
 DEFAULT_MILVUS_URI = Path("data") / "docling.db"
 DEFAULT_TOP_K = 5
 DEFAULT_NPROBE = 10  # [1, nlist]
+
+SEARCH_TOOL_ICON = Icon(
+    src=(
+        "data:image/svg+xml;utf8,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+        "<rect width='64' height='64' rx='12' fill='%23121d2f'/>"
+        "<circle cx='28' cy='28' r='14' stroke='%23c4f1ff' stroke-width='4' fill='none'/>"
+        "<line x1='40' y1='40' x2='56' y2='56' stroke='%23c4f1ff' stroke-width='5' stroke-linecap='round'/>"
+        "</svg>"
+    ),
+    mimeType="image/svg+xml",
+    sizes=["64x64"],
+)
+
+SEARCH_TOOL_ANNOTATIONS = ToolAnnotations(
+    title="Semantic Document Search",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
+SEARCH_TOOL_META = {
+    "collectionDefault": DEFAULT_COLLECTION,
+    "embeddingModel": DEFAULT_EMBED_MODEL_NAME,
+    "maintainer": "RAG",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +116,15 @@ def build_context(
 
 
 def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]]:
-    @mcp.tool()
+    @mcp.tool(
+        name="search_docs",
+        title="Search Stored Documents",
+        description="Return the most similar document chunks from the RAG store.",
+        annotations=SEARCH_TOOL_ANNOTATIONS,
+        icons=[SEARCH_TOOL_ICON],
+        meta=SEARCH_TOOL_META,
+        structured_output=True,
+    )
     def search_docs(
         query: str,
         top_k: int = DEFAULT_TOP_K,
@@ -140,7 +176,7 @@ def main() -> int:
         embed_model=args.embed_model,
     )
 
-    mcp = FastMCP("DocRAG-MilvusLite", json_response=True)
+    mcp = FastMCP("RAG", json_response=True)
     search_fn = register_tools(mcp, ctx)
 
     if args.query:
@@ -161,7 +197,7 @@ def main() -> int:
 
     if args.serve:
         logging.info("Starting FastMCP server ...")
-        mcp.run()
+        mcp.run(transport="streamable-http")
         return 0
 
     logging.info("Nothing to do: use --query for ad-hoc search or --serve to run MCP")
