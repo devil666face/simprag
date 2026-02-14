@@ -22,16 +22,17 @@ MILVUS_URI = str(Path("data") / "docling.db")
 converter = DocumentConverter()
 transformer = SentenceTransformer(EMBED_MODEL_NAME)
 dimension = transformer.get_sentence_embedding_dimension()
-tokenizer = HuggingFaceTokenizer(tokenizer=transformer.tokenizer)
+tokenizer = HuggingFaceTokenizer(
+    tokenizer=transformer.tokenizer,
+)
 chunker = HybridChunker(tokenizer=tokenizer, merge_peers=True)
 
 
 def convert_file(path: str) -> list[str]:
     """Convert a file with Docling and return contextualized chunks."""
-    result = converter.convert(path)
-    dl_doc = result.document
-    chunk_iter = chunker.chunk(dl_doc=dl_doc)
-    return [chunker.contextualize(chunk=c) for c in chunk_iter]
+    doc = converter.convert(source=path).document
+    chunk_iter = chunker.chunk(dl_doc=doc)
+    return [chunker.contextualize(chunk=chunk) for chunk in chunk_iter]
 
 
 def get_or_create_collection() -> Collection:

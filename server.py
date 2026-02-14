@@ -1,32 +1,33 @@
+#!.venv/bin/python3
 from typing import List
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
 from pymilvus import connections, Collection
 
-COLLECTION = "rag_docs"
-EMBED_MODEL_NAME = "multi-qa-MiniLM-L6-cos-v1"
-# тот же URI, что и при индексации
-MILVUS_URI = str(Path("milvus_data") / "docling.db")
+COLLECTION = "docs"
+EMBED_MODEL_NAME = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
+MILVUS_URI = str(Path("data") / "docling.db")
+
 mcp = FastMCP("DocRAG-MilvusLite", json_response=True)
+
 connections.connect("default", uri=MILVUS_URI)
-col = Collection(COLLECTION)
-col.load()
-emb_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+collection = Collection(COLLECTION)
+collection.load()
+
+transformer = SentenceTransformer(EMBED_MODEL_NAME)
 
 
 @mcp.tool()
 def search_docs(
     query: str, top_k: int = 5, source_filter: str | None = None
 ) -> List[dict]:
-    """
-    Поиск релевантных фрагментов в Milvus Lite.
-    """
-    query_vec = emb_model.encode([query]).tolist()
+    query_vec = transformer.encode([query]).tolist()
     expr = None
     if source_filter:
         expr = f'source == "{source_filter}"'
-    results = col.search(
+    results = collection.search(
         data=query_vec,
         anns_field="embedding",
         param={"metric_type": "COSINE", "params": {"nprobe": 10}},
@@ -48,4 +49,6 @@ def search_docs(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    out = search_docs("параллельные циклы")
+    print(out)
+    # mcp.run()
