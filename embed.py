@@ -26,7 +26,7 @@ DEFAULT_EMBED_MODEL_NAME = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
 DEFAULT_MILVUS_URI = Path("data") / "docling.db"
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_CHUNK_CHARS = 1024
-TEXT_FIELD_MAX_LENGTH = 8192
+DEFAULT_MAX_TEXT_LEN = 8192
 DEFAULT_EXTENSIONS = (
     ".pdf",
     ".doc",
@@ -79,11 +79,20 @@ def parse_args() -> argparse.Namespace:
         help="Approximate min characters per chunk (0 disables merging)",
     )
     parser.add_argument(
+        "--max-text-len",
+        type=int,
+        default=DEFAULT_MAX_TEXT_LEN,
+        help=(
+            "Hard max characters per stored text field "
+            "(must be within Milvus VARCHAR limits)"
+        ),
+    )
+    parser.add_argument(
         "--by-source",
         action="store_true",
         help=(
             "Merge all chunks for a single source into one text and "
-            "re-split it into pieces of up to %d characters" % TEXT_FIELD_MAX_LENGTH
+            "re-split it into pieces of up to --max-text-len characters"
         ),
     )
     parser.add_argument(
@@ -126,19 +135,16 @@ def convert_file(
     return [chunker.contextualize(chunk=chunk) for chunk in chunk_iter]
 
 
-def _split_with_max(text: str) -> list[str]:
-    """Split ``text`` into pieces not exceeding ``TEXT_FIELD_MAX_LENGTH``."""
+def _split_with_max(text: str, max_len: int) -> list[str]:
+    """Split ``text`` into pieces not exceeding ``max_len``."""
     if not text:
         return []
-    if len(text) <= TEXT_FIELD_MAX_LENGTH:
+    if len(text) <= max_len:
         return [text]
-    return [
-        text[i : i + TEXT_FIELD_MAX_LENGTH]
-        for i in range(0, len(text), TEXT_FIELD_MAX_LENGTH)
-    ]
+    return [text[i : i + max_len] for i in range(0, len(text), max_len)]
 
 
-def merge_chunks(chunks: list[str], min_chars: int) -> list[str]:
+def merge_chunks(chunks: list[str], min_chars: int, max_len: int) -> list[str]:
     """Merge smaller chunks until they reach at least ``min_chars``.
 
     Additionally enforces the hard upper limit ``TEXT_FIELD_MAX_LENGTH``
@@ -154,7 +160,7 @@ def merge_chunks(chunks: list[str], min_chars: int) -> list[str]:
     if min_chars <= 0:
         result: list[str] = []
         for chunk in clean_chunks:
-            result.extend(_split_with_max(chunk))
+            result.extend(_split_with_max(chunk, max_len))
         return result
 
     result: list[str] = []
@@ -165,8 +171,8 @@ def merge_chunks(chunks: list[str], min_chars: int) -> list[str]:
         chunk_len = len(chunk)
 
         # Если добавление чанка переполнит верхний предел — сначала сбросить буфер.
-        if buffer_parts and buffer_len + 2 + chunk_len > TEXT_FIELD_MAX_LENGTH:
-            result.extend(_split_with_max("\n\n".join(buffer_parts)))
+        if buffer_parts and buffer_len + 2 + chunk_len > max_len:
+            result.extend(_split_with_max("\n\n".join(buffer_parts), max_len))
             buffer_parts = []
             buffer_len = 0
 
@@ -180,7 +186,7 @@ def merge_chunks(chunks: list[str], min_chars: int) -> list[str]:
         if buffer_len >= min_chars:
             # Набрали достаточно текста — сбрасываем текущий буфер
             # и начинаем следующий с нового чанка.
-            result.extend(_split_with_max("\n\n".join(buffer_parts)))
+            result.extend(_split_with_max("\n\n".join(buffer_parts), max_len))
             buffer_parts = [chunk]
             buffer_len = chunk_len
         else:
@@ -189,7 +195,7 @@ def merge_chunks(chunks: list[str], min_chars: int) -> list[str]:
             buffer_len += 2 + chunk_len
 
     if buffer_parts:
-        result.extend(_split_with_max("\n\n".join(buffer_parts)))
+        result.extend(_split_with_max("\n\n".join(buffer_parts), max_len))
 
     return result
 
@@ -198,6 +204,7 @@ def get_or_create_collection(
     collection_name: str,
     milvus_uri: str,
     dim: int,
+    text_max_length: int,
 ) -> Collection:
     connections.connect("default", uri=milvus_uri)
     if utility.has_collection(collection_name):
@@ -212,12 +219,12 @@ def get_or_create_collection(
         FieldSchema(
             name="source",
             dtype=DataType.VARCHAR,
-            max_length=512,
+            max_length=1024,
         ),
         FieldSchema(
             name="text",
             dtype=DataType.VARCHAR,
-            max_length=TEXT_FIELD_MAX_LENGTH,
+            max_length=text_max_length,
         ),
         FieldSchema(
             name="embedding",
@@ -248,6 +255,28 @@ def main() -> int:
         format="%(levelname)s: %(message)s",
     )
 
+    # Validate and normalize text and chunk size settings.
+    if args.max_text_len < 1:
+        logging.warning(
+            "max-text-len (%d) is less than 1; clamping to %s", DEFAULT_MAX_TEXT_LEN
+        )
+        args.max_text_len = DEFAULT_MAX_TEXT_LEN
+    elif args.max_text_len > 65535:
+        logging.warning(
+            "max-text-len (%d) is greater than 65535; clamping to 65535",
+            args.max_text_len,
+        )
+        args.max_text_len = 65535
+
+    if args.chunk_chars > 0 and args.chunk_chars > args.max_text_len:
+        logging.warning(
+            "chunk-chars (%d) is greater than max-text-len (%d); "
+            "clamping chunk-chars to max-text-len",
+            args.chunk_chars,
+            args.max_text_len,
+        )
+        args.chunk_chars = args.max_text_len
+
     converter = DocumentConverter()
     transformer = SentenceTransformer(args.embed_model)
     dim = transformer.get_sentence_embedding_dimension()
@@ -262,6 +291,7 @@ def main() -> int:
         collection_name=args.collection,
         milvus_uri=str(args.milvus_uri),
         dim=dim,
+        text_max_length=args.max_text_len,
     )
 
     files = list(iter_source_files(args.docs, args.ext))
@@ -289,12 +319,9 @@ def main() -> int:
             if not full_text:
                 logging.debug("No text produced for %s", path)
                 continue
-            chunks = [
-                full_text[i : i + TEXT_FIELD_MAX_LENGTH]
-                for i in range(0, len(full_text), TEXT_FIELD_MAX_LENGTH)
-            ]
+            chunks = _split_with_max(full_text, args.max_text_len)
         else:
-            chunks = merge_chunks(chunks, args.chunk_chars)
+            chunks = merge_chunks(chunks, args.chunk_chars, args.max_text_len)
         if not chunks:
             logging.debug("No chunks produced for %s", path)
             continue
