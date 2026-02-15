@@ -333,12 +333,13 @@ def main() -> int:
             logging.debug("No chunks produced for %s", path)
             continue
         text_embs = transformer.encode(chunks).tolist()
-        source_name_emb = transformer.encode([path.name]).tolist()[0]
+        source_name = path.stem
+        source_name_emb = transformer.encode([source_name]).tolist()[0]
         for chunk, vec in zip(chunks, text_embs):
             logging.info("Chunk from %s (%s chars)", path, len(chunk))
             logging.debug("%s", chunk)
             # Store only the file name (not the full path) in the `source` field.
-            sources_batch.append(path.name)
+            sources_batch.append(source_name)
             texts_batch.append(chunk)
             vectors_batch.append(vec)
             source_name_vectors_batch.append(source_name_emb)
