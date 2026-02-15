@@ -25,7 +25,8 @@ DEFAULT_COLLECTION = "docs"
 DEFAULT_EMBED_MODEL_NAME = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
 DEFAULT_MILVUS_URI = Path("data") / "docling.db"
 DEFAULT_BATCH_SIZE = 512
-DEFAULT_CHUNK_CHARS = 1500
+DEFAULT_CHUNK_CHARS = 1024
+TEXT_FIELD_MAX_LENGTH = 8192
 DEFAULT_EXTENSIONS = (
     ".pdf",
     ".doc",
@@ -41,6 +42,7 @@ DEFAULT_EXTENSIONS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert documents to embeddings and store them in Milvus",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--docs",
@@ -74,7 +76,15 @@ def parse_args() -> argparse.Namespace:
         "--chunk-chars",
         type=int,
         default=DEFAULT_CHUNK_CHARS,
-        help="Approximate max characters per chunk (0 disables merging)",
+        help="Approximate min characters per chunk (0 disables merging)",
+    )
+    parser.add_argument(
+        "--by-source",
+        action="store_true",
+        help=(
+            "Merge all chunks for a single source into one text and "
+            "re-split it into pieces of up to %d characters" % TEXT_FIELD_MAX_LENGTH
+        ),
     )
     parser.add_argument(
         "--ext",
@@ -116,27 +126,72 @@ def convert_file(
     return [chunker.contextualize(chunk=chunk) for chunk in chunk_iter]
 
 
-def merge_chunks(chunks: list[str], max_chars: int) -> list[str]:
-    if max_chars <= 0:
-        return [chunk for chunk in chunks if chunk.strip()]
-    merged: list[str] = []
-    buffer: list[str] = []
-    current_len = 0
-    for raw_chunk in chunks:
-        chunk = raw_chunk.strip()
-        if not chunk:
-            continue
+def _split_with_max(text: str) -> list[str]:
+    """Split ``text`` into pieces not exceeding ``TEXT_FIELD_MAX_LENGTH``."""
+    if not text:
+        return []
+    if len(text) <= TEXT_FIELD_MAX_LENGTH:
+        return [text]
+    return [
+        text[i : i + TEXT_FIELD_MAX_LENGTH]
+        for i in range(0, len(text), TEXT_FIELD_MAX_LENGTH)
+    ]
+
+
+def merge_chunks(chunks: list[str], min_chars: int) -> list[str]:
+    """Merge smaller chunks until they reach at least ``min_chars``.
+
+    Additionally enforces the hard upper limit ``TEXT_FIELD_MAX_LENGTH``
+    so that no resulting chunk exceeds the Milvus ``text`` field size.
+
+    The last chunk for a file may still be shorter than ``min_chars``
+    if there is not enough text left to reach the threshold.
+    """
+
+    clean_chunks = [c.strip() for c in chunks if c.strip()]
+
+    # No minimum: просто уважать максимальную длину поля текста.
+    if min_chars <= 0:
+        result: list[str] = []
+        for chunk in clean_chunks:
+            result.extend(_split_with_max(chunk))
+        return result
+
+    result: list[str] = []
+    buffer_parts: list[str] = []
+    buffer_len = 0
+
+    for chunk in clean_chunks:
         chunk_len = len(chunk)
-        if buffer and current_len + chunk_len + 2 > max_chars:
-            merged.append("\n\n".join(buffer))
-            buffer = [chunk]
-            current_len = chunk_len
+
+        # Если добавление чанка переполнит верхний предел — сначала сбросить буфер.
+        if buffer_parts and buffer_len + 2 + chunk_len > TEXT_FIELD_MAX_LENGTH:
+            result.extend(_split_with_max("\n\n".join(buffer_parts)))
+            buffer_parts = []
+            buffer_len = 0
+
+        # Если буфер пустой, просто стартуем новый.
+        if not buffer_parts:
+            buffer_parts = [chunk]
+            buffer_len = chunk_len
+            continue
+
+        # Здесь буфер уже непустой и добавление не переполнит максимум.
+        if buffer_len >= min_chars:
+            # Набрали достаточно текста — сбрасываем текущий буфер
+            # и начинаем следующий с нового чанка.
+            result.extend(_split_with_max("\n\n".join(buffer_parts)))
+            buffer_parts = [chunk]
+            buffer_len = chunk_len
         else:
-            buffer.append(chunk)
-            current_len += chunk_len + (2 if buffer[:-1] else 0)
-    if buffer:
-        merged.append("\n\n".join(buffer))
-    return merged
+            # Ещё не дотянули до минимума — продолжаем naкапливать.
+            buffer_parts.append(chunk)
+            buffer_len += 2 + chunk_len
+
+    if buffer_parts:
+        result.extend(_split_with_max("\n\n".join(buffer_parts)))
+
+    return result
 
 
 def get_or_create_collection(
@@ -162,7 +217,7 @@ def get_or_create_collection(
         FieldSchema(
             name="text",
             dtype=DataType.VARCHAR,
-            max_length=8192,
+            max_length=TEXT_FIELD_MAX_LENGTH,
         ),
         FieldSchema(
             name="embedding",
@@ -227,7 +282,19 @@ def main() -> int:
             skipped += 1
             logging.warning("Skipping %s: %s", path, exc)
             continue
-        chunks = merge_chunks(chunks, args.chunk_chars)
+        if args.by_source:
+            # Concatenate all chunks for this source and then split into
+            # pieces that fit into the Milvus text field.
+            full_text = "\n\n".join(chunk.strip() for chunk in chunks if chunk.strip())
+            if not full_text:
+                logging.debug("No text produced for %s", path)
+                continue
+            chunks = [
+                full_text[i : i + TEXT_FIELD_MAX_LENGTH]
+                for i in range(0, len(full_text), TEXT_FIELD_MAX_LENGTH)
+            ]
+        else:
+            chunks = merge_chunks(chunks, args.chunk_chars)
         if not chunks:
             logging.debug("No chunks produced for %s", path)
             continue
