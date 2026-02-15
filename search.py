@@ -48,7 +48,10 @@ SEARCH_TOOL_META = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Query Milvus-backed document store")
+    parser = argparse.ArgumentParser(
+        description="Query Milvus-backed document store",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--collection",
         default=DEFAULT_COLLECTION,
@@ -82,8 +85,9 @@ def parse_args() -> argparse.Namespace:
         help="Ad-hoc query to run instead of starting MCP server",
     )
     parser.add_argument(
-        "--source",
-        help="Optional path filter for search",
+        "--list-sources",
+        action="store_true",
+        help="Print all distinct source values in the collection and exit",
     )
     parser.add_argument(
         "--serve",
@@ -113,6 +117,37 @@ def build_context(
     collection.load()
     transformer = SentenceTransformer(embed_model)
     return SearchContext(collection=collection, transformer=transformer)
+
+
+def list_sources(ctx: SearchContext, limit: int = 16384) -> int:
+    """Print all distinct source values from the collection.
+
+    Returns process exit code (0 on success, non-zero on failure).
+    """
+
+    logging.info("Listing distinct sources from collection '%s'", ctx.collection.name)
+    try:
+        # Milvus требует указывать limit, если expr пустой.
+        rows_any = ctx.collection.query(
+            expr="",
+            output_fields=["source"],
+            limit=limit,
+        )
+        rows_result = getattr(rows_any, "result", None)
+        rows_iter: Iterable[dict]
+        if callable(rows_result):
+            rows_iter = cast(Iterable[dict], rows_result())
+        else:
+            rows_iter = cast(Iterable[dict], rows_any)
+    except Exception as exc:  # pragma: no cover - logging only
+        logging.error("Failed to query sources: %s", exc)
+        return 1
+
+    sources = sorted({row.get("source", "") for row in rows_iter if row.get("source")})
+    for src in sources:
+        print(src)
+    logging.info("Found %d distinct sources", len(sources))
+    return 0
 
 
 def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]]:
@@ -175,6 +210,9 @@ def main() -> int:
         milvus_uri=str(args.milvus_uri),
         embed_model=args.embed_model,
     )
+
+    if args.list_sources:
+        return list_sources(ctx)
 
     mcp = FastMCP("RAG", json_response=True)
     search_fn = register_tools(mcp, ctx)
