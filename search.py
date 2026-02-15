@@ -18,6 +18,7 @@ DEFAULT_EMBED_MODEL_NAME = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
 DEFAULT_MILVUS_URI = Path("data") / "docling.db"
 DEFAULT_TOP_K = 5
 DEFAULT_NPROBE = 10  # [1, nlist]
+DEFAULT_SOURCE_NAME_CANDIDATES = 5
 
 SEARCH_TOOL_ICON = Icon(
     src=(
@@ -82,7 +83,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--query",
-        help="Ad-hoc query to run instead of starting MCP server",
+        nargs="?",
+        default=None,
+        const="",
+        metavar="TEXT",
+        help=(
+            "Ad-hoc query to run instead of starting MCP server. "
+            "Omit TEXT (i.e., pass --query without a value) to run a source-only search."
+        ),
+    )
+    parser.add_argument(
+        "--source-name",
+        nargs="?",
+        default=None,
+        const="",
+        metavar="NAME",
+        help=(
+            "File name to use for vector-based source search. "
+            "Omit NAME (i.e., pass --source-name without a value) to disable it."
+        ),
     )
     parser.add_argument(
         "--list-sources",
@@ -162,20 +181,135 @@ def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]
     )
     def search_docs(
         query: str,
+        source_name: str | None = None,
         top_k: int = DEFAULT_TOP_K,
-        source_filter: str | None = None,
         nprobe: int = DEFAULT_NPROBE,
     ) -> List[dict]:
-        query_vec = ctx.transformer.encode([query]).tolist()
-        expr = None
-        if source_filter:
-            expr = f'source == "{source_filter}"'
+        """Search documents with optional file-name based filtering.
+
+        - If ``source_name`` is provided, it is embedded and used to search the
+          ``source_name_embedding`` field to find the closest file names.
+          Then:
+            * if ``query`` is non-empty, a semantic search is run over
+              ``text_embedding`` restricted to those sources;
+            * if ``query`` is empty, all chunks for those sources are returned
+              without additional vector search.
+        - Otherwise, a regular semantic search over ``text_embedding`` is
+          performed across all documents.
+        """
+
+        normalized_query = (query or "").strip()
+        has_query = bool(normalized_query)
+        source_name_value = (source_name or "").strip()
+        has_source_name = bool(source_name_value)
+
+        # Helper: convert Milvus query() rows into output rows.
+        def _rows_to_out(rows_any: object) -> List[dict]:
+            rows_result = getattr(rows_any, "result", None)
+            if callable(rows_result):
+                rows_iter = cast(Iterable[dict], rows_result())
+            else:
+                rows_iter = cast(Iterable[dict], rows_any)
+            out_rows: List[dict] = []
+            for row in rows_iter:
+                out_rows.append(
+                    {
+                        "text": row.get("text"),
+                        "source": row.get("source"),
+                        "score": 1.0,
+                    }
+                )
+            return out_rows
+
+        # 1) If a file-name vector search is requested.
+        if has_source_name:
+            name_limit = max(DEFAULT_SOURCE_NAME_CANDIDATES, top_k)
+            name_vec = ctx.transformer.encode([source_name_value]).tolist()
+            name_search = ctx.collection.search(
+                data=name_vec,
+                anns_field="source_name_embedding",
+                param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
+                limit=max(name_limit, 1),
+                output_fields=["source"],
+            )
+            result_fn = getattr(name_search, "result", None)
+            if callable(result_fn):
+                name_search = result_fn()
+            candidate_sources: list[str] = []
+            for hits in cast(Iterable, name_search):
+                for hit in hits:
+                    src_val = hit.entity.get("source")
+                    if src_val:
+                        src_str = str(src_val)
+                        if src_str not in candidate_sources:
+                            candidate_sources.append(src_str)
+                    if len(candidate_sources) >= name_limit:
+                        break
+                if len(candidate_sources) >= name_limit:
+                    break
+
+            if not candidate_sources:
+                logging.debug("No sources matched source_name '%s'", source_name_value)
+                return []
+
+            if not has_query:
+                # Return all chunks for every candidate source.
+                out_rows: List[dict] = []
+                for src in candidate_sources:
+                    rows_any = ctx.collection.query(
+                        expr=f'source == "{src}"',
+                        output_fields=["text", "source"],
+                        limit=16384,
+                    )
+                    out_rows.extend(_rows_to_out(rows_any))
+                logging.debug(
+                    "Source-name-only search returned %s chunks for %s",
+                    len(out_rows),
+                    candidate_sources,
+                )
+                return out_rows
+
+            # Vector search within the candidate sources.
+            query_vec = ctx.transformer.encode([normalized_query]).tolist()
+            sources_expr = json.dumps(candidate_sources, ensure_ascii=False)
+            expr_clause = f"source in {sources_expr}"
+            results = ctx.collection.search(
+                data=query_vec,
+                anns_field="text_embedding",
+                param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
+                limit=top_k,
+                expr=expr_clause,
+                output_fields=["text", "source"],
+            )
+            result_fn = getattr(results, "result", None)
+            if callable(result_fn):
+                results = result_fn()
+            iterable_results = cast(Iterable, results)
+            out: List[dict] = []
+            for hits in iterable_results:
+                for hit in hits:
+                    out.append(
+                        {
+                            "text": hit.entity.get("text"),
+                            "source": hit.entity.get("source"),
+                            "score": float(hit.distance),
+                        }
+                    )
+            logging.debug(
+                "Source-name + query search returned %s results across %s",
+                len(out),
+                candidate_sources,
+            )
+            return out
+
+        # 2) Regular semantic search over text embeddings across all sources.
+        query_vec = ctx.transformer.encode([normalized_query]).tolist()
         results = ctx.collection.search(
             data=query_vec,
-            anns_field="embedding",
+            anns_field="text_embedding",
             param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
             limit=top_k,
-            expr=expr,
+            expr=None,
             output_fields=["text", "source"],
         )
         result_fn = getattr(results, "result", None)
@@ -217,17 +351,20 @@ def main() -> int:
     mcp = FastMCP("RAG", json_response=True)
     search_fn = register_tools(mcp, ctx)
 
-    if args.query:
+    source_name_value = (args.source_name or "").strip() if args.source_name else None
+    should_run_query = args.query is not None or bool(source_name_value)
+    if should_run_query:
+        query_value = args.query if args.query is not None else ""
         logging.info(
-            "Running one-off query '%s' (top_k=%s, source=%s)",
-            args.query,
+            "Running one-off query '%s' (top_k=%s, source_name=%s)",
+            query_value,
             args.top_k,
-            args.source or "*",
+            source_name_value or "",
         )
         results = search_fn(
-            query=args.query,
+            query=query_value,
             top_k=args.top_k,
-            source_filter=args.source,
+            source_name=source_name_value,
             nprobe=args.nprobe,
         )
         print(json.dumps(results, ensure_ascii=False, indent=2))

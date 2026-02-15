@@ -227,24 +227,30 @@ def get_or_create_collection(
             max_length=text_max_length,
         ),
         FieldSchema(
-            name="embedding",
+            name="text_embedding",
+            dtype=DataType.FLOAT_VECTOR,
+            dim=dim,
+        ),
+        FieldSchema(
+            name="source_name_embedding",
             dtype=DataType.FLOAT_VECTOR,
             dim=dim,
         ),
     ]
     schema = CollectionSchema(fields, description="RAG documents")
     collection = Collection(name=collection_name, schema=schema)
-    index_result = collection.create_index(
-        field_name="embedding",
-        index_params={
-            "index_type": "IVF_FLAT",
-            "metric_type": "COSINE",
-            "params": {"nlist": 1024},
-        },
-        _async=False,
-    )
-    if asyncio.iscoroutine(index_result):
-        asyncio.run(index_result)
+    for field_name in ("text_embedding", "source_name_embedding"):
+        index_result = collection.create_index(
+            field_name=field_name,
+            index_params={
+                "index_type": "IVF_FLAT",
+                "metric_type": "COSINE",
+                "params": {"nlist": 1024},
+            },
+            _async=False,
+        )
+        if asyncio.iscoroutine(index_result):
+            asyncio.run(index_result)
     return collection
 
 
@@ -302,6 +308,7 @@ def main() -> int:
     sources_batch: list[str] = []
     texts_batch: list[str] = []
     vectors_batch: list[list[float]] = []
+    source_name_vectors_batch: list[list[float]] = []
     ingested = 0
     skipped = 0
 
@@ -325,15 +332,25 @@ def main() -> int:
         if not chunks:
             logging.debug("No chunks produced for %s", path)
             continue
-        embs = transformer.encode(chunks).tolist()
-        for chunk, vec in zip(chunks, embs):
+        text_embs = transformer.encode(chunks).tolist()
+        source_name_emb = transformer.encode([path.name]).tolist()[0]
+        for chunk, vec in zip(chunks, text_embs):
             logging.info("Chunk from %s (%s chars)", path, len(chunk))
             logging.debug("%s", chunk)
-            sources_batch.append(str(path))
+            # Store only the file name (not the full path) in the `source` field.
+            sources_batch.append(path.name)
             texts_batch.append(chunk)
             vectors_batch.append(vec)
+            source_name_vectors_batch.append(source_name_emb)
             if args.batch_size > 0 and len(vectors_batch) >= args.batch_size:
-                collection.insert([sources_batch, texts_batch, vectors_batch])
+                collection.insert(
+                    [
+                        sources_batch,
+                        texts_batch,
+                        vectors_batch,
+                        source_name_vectors_batch,
+                    ]
+                )
                 ingested += len(vectors_batch)
                 logging.info(
                     "Inserted %s chunks (total %s)", len(vectors_batch), ingested
@@ -341,9 +358,17 @@ def main() -> int:
                 sources_batch.clear()
                 texts_batch.clear()
                 vectors_batch.clear()
+                source_name_vectors_batch.clear()
 
     if vectors_batch:
-        collection.insert([sources_batch, texts_batch, vectors_batch])
+        collection.insert(
+            [
+                sources_batch,
+                texts_batch,
+                vectors_batch,
+                source_name_vectors_batch,
+            ]
+        )
         ingested += len(vectors_batch)
         logging.info("Inserted final %s chunks", len(vectors_batch))
 
