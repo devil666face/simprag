@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, cast
+from typing import Iterable, List, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import Icon, ToolAnnotations
@@ -19,6 +19,7 @@ DEFAULT_MILVUS_URI = Path("data") / "docling.db"
 DEFAULT_TOP_K = 5
 DEFAULT_NPROBE = 10  # [1, nlist]
 DEFAULT_SOURCE_NAME_CANDIDATES = 5
+DEFAULT_SOURCE_LIST_LIMIT = 16384
 
 SEARCH_TOOL_ICON = Icon(
     src=(
@@ -46,6 +47,14 @@ SEARCH_TOOL_META = {
     "embeddingModel": DEFAULT_EMBED_MODEL_NAME,
     "maintainer": "RAG",
 }
+
+LIST_SOURCES_TOOL_ANNOTATIONS = ToolAnnotations(
+    title="List Document Sources",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,11 +147,8 @@ def build_context(
     return SearchContext(collection=collection, transformer=transformer)
 
 
-def list_sources(ctx: SearchContext, limit: int = 16384) -> int:
-    """Print all distinct source values from the collection.
-
-    Returns process exit code (0 on success, non-zero on failure).
-    """
+def list_sources(ctx: SearchContext) -> List[str]:
+    """Return all distinct source values from the collection."""
 
     logging.info("Listing distinct sources from collection '%s'", ctx.collection.name)
     try:
@@ -150,199 +156,146 @@ def list_sources(ctx: SearchContext, limit: int = 16384) -> int:
         rows_any = ctx.collection.query(
             expr="",
             output_fields=["source"],
-            limit=limit,
+            limit=DEFAULT_SOURCE_LIST_LIMIT,
         )
+    except Exception as exc:  # pragma: no cover - logging only
+        logging.error("Failed to query sources: %s", exc)
+        raise
+
+    rows_result = getattr(rows_any, "result", None)
+    if callable(rows_result):
+        rows_iter = cast(Iterable[dict], rows_result())
+    else:
+        rows_iter = cast(Iterable[dict], rows_any)
+
+    sources = sorted({row.get("source", "") for row in rows_iter if row.get("source")})
+    logging.info("Found %d distinct sources", len(sources))
+    return sources
+
+
+def search_docs(
+    ctx: SearchContext,
+    query: str,
+    source_name: str | None = None,
+    top_k: int = DEFAULT_TOP_K,
+    nprobe: int = DEFAULT_NPROBE,
+) -> List[dict]:
+    """Search documents with optional file-name based filtering."""
+
+    normalized_query = (query or "").strip()
+    has_query = bool(normalized_query)
+    source_name_value = (source_name or "").strip()
+    has_source_name = bool(source_name_value)
+
+    # Helper: convert Milvus query() rows into output rows.
+    def _rows_to_out(rows_any: object) -> List[dict]:
         rows_result = getattr(rows_any, "result", None)
-        rows_iter: Iterable[dict]
         if callable(rows_result):
             rows_iter = cast(Iterable[dict], rows_result())
         else:
             rows_iter = cast(Iterable[dict], rows_any)
-    except Exception as exc:  # pragma: no cover - logging only
-        logging.error("Failed to query sources: %s", exc)
-        return 1
-
-    sources = sorted({row.get("source", "") for row in rows_iter if row.get("source")})
-    for src in sources:
-        print(src)
-    logging.info("Found %d distinct sources", len(sources))
-    return 0
-
-
-def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]]:
-    @mcp.tool(
-        name="search_docs",
-        title="Search Stored Documents",
-        description="Return the most similar document chunks from the RAG store.",
-        annotations=SEARCH_TOOL_ANNOTATIONS,
-        icons=[SEARCH_TOOL_ICON],
-        meta=SEARCH_TOOL_META,
-        structured_output=True,
-    )
-    def search_docs(
-        query: str,
-        source_name: str | None = None,
-        top_k: int = DEFAULT_TOP_K,
-        nprobe: int = DEFAULT_NPROBE,
-    ) -> List[dict]:
-        """Search documents with optional file-name based filtering.
-
-        - If ``source_name`` is provided, it is embedded and used to search the
-          ``source_name_embedding`` field to find the closest file names.
-          Then:
-            * if ``query`` is non-empty, a semantic search is run over
-              ``text_embedding`` restricted to those sources;
-            * if ``query`` is empty, all chunks for those sources are returned
-              without additional vector search.
-        - Otherwise, a regular semantic search over ``text_embedding`` is
-          performed across all documents.
-        """
-
-        normalized_query = (query or "").strip()
-        has_query = bool(normalized_query)
-        source_name_value = (source_name or "").strip()
-        has_source_name = bool(source_name_value)
-
-        # Helper: convert Milvus query() rows into output rows.
-        def _rows_to_out(rows_any: object) -> List[dict]:
-            rows_result = getattr(rows_any, "result", None)
-            if callable(rows_result):
-                rows_iter = cast(Iterable[dict], rows_result())
-            else:
-                rows_iter = cast(Iterable[dict], rows_any)
-            out_rows: List[dict] = []
-            for row in rows_iter:
-                out_rows.append(
-                    {
-                        "text": row.get("text"),
-                        "source": row.get("source"),
-                        "score": 1.0,
-                    }
-                )
-            return out_rows
-
-        def _quote_expr_value(value: str) -> str:
-            """Return a JSON-style literal safe for Milvus expr strings."""
-
-            return json.dumps(value, ensure_ascii=False)
-
-        control_chars = {"\n", "\r", "\t"}
-
-        def _make_source_predicate(value: str) -> str | None:
-            if not value:
-                return None
-            if any(char in value for char in control_chars):
-                cleaned = value
-                for char in control_chars:
-                    cleaned = cleaned.replace(char, "")
-                cleaned = cleaned.strip()
-                if not cleaned:
-                    return None
-                pattern = f"%{cleaned}%"
-                return f"source LIKE {_quote_expr_value(pattern)}"
-            return f"source == {_quote_expr_value(value)}"
-
-        def _combine_source_predicates(values: Iterable[str]) -> str | None:
-            clauses: list[str] = []
-            for val in values:
-                clause = _make_source_predicate(val)
-                if clause:
-                    clauses.append(f"({clause})")
-            if not clauses:
-                return None
-            return "(" + " OR ".join(clauses) + ")"
-
-        # 1) If a file-name vector search is requested.
-        if has_source_name:
-            name_limit = max(DEFAULT_SOURCE_NAME_CANDIDATES, top_k)
-            name_vec = ctx.transformer.encode([source_name_value]).tolist()
-            name_search = ctx.collection.search(
-                data=name_vec,
-                anns_field="source_name_embedding",
-                param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
-                limit=max(name_limit, 1),
-                output_fields=["source"],
+        out_rows: List[dict] = []
+        for row in rows_iter:
+            out_rows.append(
+                {
+                    "text": row.get("text"),
+                    "source": row.get("source"),
+                    "score": 1.0,
+                }
             )
-            result_fn = getattr(name_search, "result", None)
-            if callable(result_fn):
-                name_search = result_fn()
-            candidate_sources: list[str] = []
-            for hits in cast(Iterable, name_search):
-                for hit in hits:
-                    src_val = hit.entity.get("source")
-                    if src_val:
-                        src_str = str(src_val)
-                        if src_str not in candidate_sources:
-                            candidate_sources.append(src_str)
-                    if len(candidate_sources) >= name_limit:
-                        break
+        return out_rows
+
+    def _quote_expr_value(value: str) -> str:
+        """Return a JSON-style literal safe for Milvus expr strings."""
+
+        return json.dumps(value, ensure_ascii=False)
+
+    control_chars = {"\n", "\r", "\t"}
+
+    def _make_source_predicate(value: str) -> str | None:
+        if not value:
+            return None
+        if any(char in value for char in control_chars):
+            cleaned = value
+            for char in control_chars:
+                cleaned = cleaned.replace(char, "")
+            cleaned = cleaned.strip()
+            if not cleaned:
+                return None
+            pattern = f"%{cleaned}%"
+            return f"source LIKE {_quote_expr_value(pattern)}"
+        return f"source == {_quote_expr_value(value)}"
+
+    def _combine_source_predicates(values: Iterable[str]) -> str | None:
+        clauses: list[str] = []
+        for val in values:
+            clause = _make_source_predicate(val)
+            if clause:
+                clauses.append(f"({clause})")
+        if not clauses:
+            return None
+        return "(" + " OR ".join(clauses) + ")"
+
+    # 1) If a file-name vector search is requested.
+    if has_source_name:
+        name_limit = max(DEFAULT_SOURCE_NAME_CANDIDATES, top_k)
+        name_vec = ctx.transformer.encode([source_name_value]).tolist()
+        name_search = ctx.collection.search(
+            data=name_vec,
+            anns_field="source_name_embedding",
+            param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
+            limit=max(name_limit, 1),
+            output_fields=["source"],
+        )
+        result_fn = getattr(name_search, "result", None)
+        if callable(result_fn):
+            name_search = result_fn()
+        candidate_sources: list[str] = []
+        for hits in cast(Iterable, name_search):
+            for hit in hits:
+                src_val = hit.entity.get("source")
+                if src_val:
+                    src_str = str(src_val)
+                    if src_str not in candidate_sources:
+                        candidate_sources.append(src_str)
                 if len(candidate_sources) >= name_limit:
                     break
+            if len(candidate_sources) >= name_limit:
+                break
 
-            if not candidate_sources:
-                logging.debug("No sources matched source_name '%s'", source_name_value)
-                return []
+        if not candidate_sources:
+            logging.debug("No sources matched source_name '%s'", source_name_value)
+            return []
 
-            if not has_query:
-                # Return all chunks for every candidate source.
-                out_rows: List[dict] = []
-                for src in candidate_sources:
-                    predicate = _make_source_predicate(src)
-                    if not predicate:
-                        continue
-                    rows_any = ctx.collection.query(
-                        expr=predicate,
-                        output_fields=["text", "source"],
-                        limit=16384,
-                    )
-                    out_rows.extend(_rows_to_out(rows_any))
-                logging.debug(
-                    "Source-name-only search returned %s chunks for %s",
-                    len(out_rows),
-                    candidate_sources,
+        if not has_query:
+            # Return all chunks for every candidate source.
+            out_rows: List[dict] = []
+            for src in candidate_sources:
+                predicate = _make_source_predicate(src)
+                if not predicate:
+                    continue
+                rows_any = ctx.collection.query(
+                    expr=predicate,
+                    output_fields=["text", "source"],
+                    limit=DEFAULT_SOURCE_LIST_LIMIT,
                 )
-                return out_rows
-
-            # Vector search within the candidate sources.
-            query_vec = ctx.transformer.encode([normalized_query]).tolist()
-            expr_clause = _combine_source_predicates(candidate_sources)
-            results = ctx.collection.search(
-                data=query_vec,
-                anns_field="text_embedding",
-                param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
-                limit=top_k,
-                expr=expr_clause,
-                output_fields=["text", "source"],
-            )
-            result_fn = getattr(results, "result", None)
-            if callable(result_fn):
-                results = result_fn()
-            iterable_results = cast(Iterable, results)
-            out: List[dict] = []
-            for hits in iterable_results:
-                for hit in hits:
-                    out.append(
-                        {
-                            "text": hit.entity.get("text"),
-                            "source": hit.entity.get("source"),
-                            "score": float(hit.distance),
-                        }
-                    )
+                out_rows.extend(_rows_to_out(rows_any))
             logging.debug(
-                "Source-name + query search returned %s results across %s",
-                len(out),
+                "Source-name-only search returned %s chunks for %s",
+                len(out_rows),
                 candidate_sources,
             )
-            return out
+            return out_rows
 
-        # 2) Regular semantic search over text embeddings across all sources.
+        # Vector search within the candidate sources.
         query_vec = ctx.transformer.encode([normalized_query]).tolist()
+        expr_clause = _combine_source_predicates(candidate_sources)
         results = ctx.collection.search(
             data=query_vec,
             anns_field="text_embedding",
             param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
             limit=top_k,
-            expr=None,
+            expr=expr_clause,
             output_fields=["text", "source"],
         )
         result_fn = getattr(results, "result", None)
@@ -359,10 +312,75 @@ def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]
                         "score": float(hit.distance),
                     }
                 )
-        logging.debug("Search returned %s results", len(out))
+        logging.debug(
+            "Source-name + query search returned %s results across %s",
+            len(out),
+            candidate_sources,
+        )
         return out
 
-    return search_docs
+    # 2) Regular semantic search over text embeddings across all sources.
+    query_vec = ctx.transformer.encode([normalized_query]).tolist()
+    results = ctx.collection.search(
+        data=query_vec,
+        anns_field="text_embedding",
+        param={"metric_type": "COSINE", "params": {"nprobe": nprobe}},
+        limit=top_k,
+        expr=None,
+        output_fields=["text", "source"],
+    )
+    result_fn = getattr(results, "result", None)
+    if callable(result_fn):
+        results = result_fn()
+    iterable_results = cast(Iterable, results)
+    out: List[dict] = []
+    for hits in iterable_results:
+        for hit in hits:
+            out.append(
+                {
+                    "text": hit.entity.get("text"),
+                    "source": hit.entity.get("source"),
+                    "score": float(hit.distance),
+                }
+            )
+    logging.debug("Search returned %s results", len(out))
+    return out
+
+
+def register_tools(mcp: FastMCP, ctx: SearchContext) -> None:
+    @mcp.tool(
+        name="search_docs",
+        title="Search Stored Documents",
+        description="Return the most similar document chunks from the RAG store.",
+        annotations=SEARCH_TOOL_ANNOTATIONS,
+        icons=[SEARCH_TOOL_ICON],
+        meta=SEARCH_TOOL_META,
+        structured_output=True,
+    )
+    def search_docs_tool(
+        query: str,
+        source_name: str | None = None,
+        top_k: int = DEFAULT_TOP_K,
+        nprobe: int = DEFAULT_NPROBE,
+    ) -> List[dict]:
+        return search_docs(
+            ctx=ctx,
+            query=query,
+            source_name=source_name,
+            top_k=top_k,
+            nprobe=nprobe,
+        )
+
+    @mcp.tool(
+        name="list_sources",
+        title="List Document Sources",
+        description="Return the sorted set of distinct `source` values stored in the Milvus collection.",
+        annotations=LIST_SOURCES_TOOL_ANNOTATIONS,
+        icons=[SEARCH_TOOL_ICON],
+        structured_output=True,
+    )
+    def list_sources_tool() -> List[str]:
+        return list_sources(ctx)
 
 
 def main() -> int:
@@ -379,10 +397,12 @@ def main() -> int:
     )
 
     if args.list_sources:
-        return list_sources(ctx)
+        for src in list_sources(ctx):
+            print(src)
+        return 0
 
     mcp = FastMCP("RAG", json_response=True)
-    search_fn = register_tools(mcp, ctx)
+    register_tools(mcp, ctx)
 
     source_name_value = (args.source_name or "").strip() if args.source_name else None
     should_run_query = args.query is not None or bool(source_name_value)
@@ -394,7 +414,8 @@ def main() -> int:
             args.top_k,
             source_name_value or "",
         )
-        results = search_fn(
+        results = search_docs(
+            ctx=ctx,
             query=query_value,
             top_k=args.top_k,
             source_name=source_name_value,
@@ -404,7 +425,7 @@ def main() -> int:
         return 0
 
     if args.serve:
-        logging.info("Starting FastMCP server ...")
+        logging.info("Starting MCP server")
         mcp.run(transport="streamable-http")
         return 0
 
