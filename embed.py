@@ -333,7 +333,8 @@ def main() -> int:
             logging.debug("No chunks produced for %s", path)
             continue
         text_embs = transformer.encode(chunks).tolist()
-        source_name = path.stem
+        source_name_raw = path.stem
+        source_name = source_name_raw.strip() or source_name_raw
         source_name_emb = transformer.encode([source_name]).tolist()[0]
         for chunk, vec in zip(chunks, text_embs):
             logging.info("Chunk from %s (%s chars)", path, len(chunk))

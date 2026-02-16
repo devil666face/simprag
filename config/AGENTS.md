@@ -15,6 +15,7 @@
 - **Purpose:** Retrieve the most relevant document chunks from the Milvus collection to support grounded answers.
 - **Arguments:**
 - `query` _(string, optional)_ – Natural-language search request compiled from the latest user need. Leave empty (or omit) when you only need to list chunks for a specific `source_name`.
+  - Queries may be written in any language; pick the user's language when possible.
   - `source_name` _(string, optional)_ – File-name hint (without extension). When provided, the tool first ranks file names by this hint and either returns all chunks from the closest matches (if `query` is empty) or searches only inside them (if `query` is non-empty). Pass an empty string to disable.
   - `top_k` _(int, optional, default 5)_ – Increase when the user asks for many references; lower to focus results.
   - `nprobe` _(int, optional, default 10)_ – Advanced Milvus IVF search parameter; adjust only if latency/recall trade-offs are requested.

@@ -221,6 +221,37 @@ def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]
                 )
             return out_rows
 
+        def _quote_expr_value(value: str) -> str:
+            """Return a JSON-style literal safe for Milvus expr strings."""
+
+            return json.dumps(value, ensure_ascii=False)
+
+        control_chars = {"\n", "\r", "\t"}
+
+        def _make_source_predicate(value: str) -> str | None:
+            if not value:
+                return None
+            if any(char in value for char in control_chars):
+                cleaned = value
+                for char in control_chars:
+                    cleaned = cleaned.replace(char, "")
+                cleaned = cleaned.strip()
+                if not cleaned:
+                    return None
+                pattern = f"%{cleaned}%"
+                return f"source LIKE {_quote_expr_value(pattern)}"
+            return f"source == {_quote_expr_value(value)}"
+
+        def _combine_source_predicates(values: Iterable[str]) -> str | None:
+            clauses: list[str] = []
+            for val in values:
+                clause = _make_source_predicate(val)
+                if clause:
+                    clauses.append(f"({clause})")
+            if not clauses:
+                return None
+            return "(" + " OR ".join(clauses) + ")"
+
         # 1) If a file-name vector search is requested.
         if has_source_name:
             name_limit = max(DEFAULT_SOURCE_NAME_CANDIDATES, top_k)
@@ -256,8 +287,11 @@ def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]
                 # Return all chunks for every candidate source.
                 out_rows: List[dict] = []
                 for src in candidate_sources:
+                    predicate = _make_source_predicate(src)
+                    if not predicate:
+                        continue
                     rows_any = ctx.collection.query(
-                        expr=f'source == "{src}"',
+                        expr=predicate,
                         output_fields=["text", "source"],
                         limit=16384,
                     )
@@ -271,8 +305,7 @@ def register_tools(mcp: FastMCP, ctx: SearchContext) -> Callable[..., List[dict]
 
             # Vector search within the candidate sources.
             query_vec = ctx.transformer.encode([normalized_query]).tolist()
-            sources_expr = json.dumps(candidate_sources, ensure_ascii=False)
-            expr_clause = f"source in {sources_expr}"
+            expr_clause = _combine_source_predicates(candidate_sources)
             results = ctx.collection.search(
                 data=query_vec,
                 anns_field="text_embedding",
